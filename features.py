@@ -18,9 +18,11 @@ import asyncio
 from collections import deque
 import csv
 import io
+import json
 import logging
 import os
 import random
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from html import escape
@@ -362,6 +364,7 @@ async def init_db():
         ("destinations", "added_by_name", "TEXT NOT NULL DEFAULT ''"),
         ("destinations", "added_role", "TEXT NOT NULL DEFAULT ''"),
         ("welcomes", "created_by", f"{big} NOT NULL DEFAULT 0"),
+        ("welcomes", "buttons", "TEXT NOT NULL DEFAULT ''"),  # add-on: link buttons under a message (JSON)
     ):
         try:
             await db_execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col} {_ddl}")
@@ -672,12 +675,121 @@ async def wipe_chat(bot: Bot, chat_id: int, extra=()) -> int:
     return len(ids)
 
 
+# ---- link buttons under a message (add-on) ----
+MAX_BTN, MAX_BTN_TEXT = 6, 30
+_URL_RE = re.compile(r"^(https?://[^\s/?#]+\S*|tg://\S+)$", re.I)
+BTN_FORMAT = ("<code>Button text | https://link</code> – one button per line, or up to 3 side by side: "
+              "<code>Text | link | Text | link</code>")
+
+
+def btn_rows(w: dict) -> list[list[dict]]:
+    """Saved buttons of a message: rows of {'t': text, 'u': url}."""
+    try:
+        rows = json.loads(w.get("buttons") or "[]")
+        return [[{"t": str(b["t"]), "u": str(b["u"])} for b in row] for row in rows if row]
+    except Exception:
+        return []
+
+
+def btn_count(w: dict) -> int:
+    return sum(len(r) for r in btn_rows(w))
+
+
+def with_buttons(w: dict, reply_markup=None):
+    """The message's own link buttons first, then whatever markup the sender adds (e.g. Unsubscribe)."""
+    own = btn_rows(w)
+    if not own:
+        return reply_markup
+    rows = [[InlineKeyboardButton(text=b["t"], url=b["u"]) for b in row] for row in own]
+    if reply_markup is not None:
+        rows += [list(r) for r in reply_markup.inline_keyboard]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parse_buttons(text: str, existing: int):
+    """'Text | link' per line (more pairs on one line = same row). Returns (rows, error_html)."""
+    rows = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 2 or len(parts) % 2:
+            return None, f"❌ Could not read: <code>{escape(line[:60])}</code>\nUse {BTN_FORMAT}"
+        row = []
+        for i in range(0, len(parts), 2):
+            t, u = parts[i], parts[i + 1]
+            if u.lower().startswith(("t.me/", "telegram.me/")):
+                u = "https://" + u
+            if not t or len(t) > MAX_BTN_TEXT:
+                return None, f"❌ Button text must be 1–{MAX_BTN_TEXT} characters: <code>{escape(t[:40])}</code>"
+            if len(u) > 512 or not _URL_RE.match(u):
+                return None, (f"❌ Invalid link: <code>{escape(u[:60])}</code>\n"
+                              "It must start with https://, http:// or tg://")
+            row.append({"t": t, "u": u})
+        if len(row) > 3:
+            return None, "❌ At most 3 buttons per row."
+        rows.append(row)
+    if not rows:
+        return None, f"❌ Nothing to add. Use {BTN_FORMAT}"
+    if existing + sum(len(r) for r in rows) > MAX_BTN:
+        return None, f"❌ A message can have at most {MAX_BTN} buttons (you can add {MAX_BTN - existing} more)."
+    return rows, None
+
+
+def btn_remove(w: dict, idx: int) -> list[list[dict]]:
+    n, out = 0, []
+    for row in btn_rows(w):
+        keep = []
+        for b in row:
+            if n != idx:
+                keep.append(b)
+            n += 1
+        if keep:
+            out.append(keep)
+    return out
+
+
+async def wl_set_buttons(wid: int, rows: list) -> None:
+    await db_execute("UPDATE welcomes SET buttons=? WHERE id=?", json.dumps(rows, ensure_ascii=False), wid)
+
+
+def btn_prompt(w: dict) -> str:
+    return (
+        f"🔘 Send the button(s) as {BTN_FORMAT}\n\n"
+        "Example: <code>Join our community | https://t.me/example</code>\n"
+        f"Text up to {MAX_BTN_TEXT} characters · links start with https:// (t.me/… also works) · "
+        f"you can add <b>{MAX_BTN - btn_count(w)}</b> more.\n\n/cancel to abort."
+    )
+
+
+def btns_view(w: dict, pfx: str, back: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Buttons screen of a message. pfx = 'ms' (admin) or 'hp' (helper)."""
+    flat = [b for row in btn_rows(w) for b in row]
+    lines = [f"{i}. {escape(b['t'])} → {escape(b['u'])}" for i, b in enumerate(flat, 1)]
+    text = (
+        f"🔘 <b>Buttons — {escape(w['name'])}</b>\n\n"
+        + ("\n".join(lines) if lines else "<i>No buttons yet.</i>")
+        + f"\n\n<i>Up to {MAX_BTN} link buttons. They appear under the message.</i>"
+    )
+    rows = []
+    if len(flat) < MAX_BTN:
+        rows.append([btn("➕ Add button", f"{pfx}:btnadd:{w['id']}")])
+    for i, b in enumerate(flat):
+        rows.append([btn(f"🗑 Remove: {b['t'][:24]}", f"{pfx}:btnrm:{w['id']}:{i}")])
+    if flat:
+        rows.append([btn("👁 Preview (real look)", f"{pfx}:view:{w['id']}")])
+    rows.append([btn("⬅️ Back", back)])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def deliver_welcome(bot: Bot, chat_id: int, w: dict, user, chat_title: str,
                           reply_markup=None) -> bool:
     """Send a message exactly as the receiver will see it. Returns False if empty."""
     text = render_welcome(w.get("caption") or "", user, chat_title).strip()
     mtype, mid = w.get("media_type") or "", w.get("media_id") or ""
     ids: list = []
+    reply_markup = with_buttons(w, reply_markup)  # add-on: the message's own link buttons
 
     if mid:
         # Telegram caption limit is 1024 → longer text is sent as a follow-up message
@@ -1713,6 +1825,8 @@ class Form(StatesGroup):
     h_caption = State()    # add-on: helper edits his own messages
     h_media = State()
     h_name = State()
+    wl_buttons = State()   # add-on: admin adds link buttons to a message
+    h_buttons = State()    # add-on: helper adds link buttons to his message
 
 
 def fmt_duration(seconds: float) -> str:
@@ -1990,9 +2104,65 @@ async def hp_dest_view(bot: Bot, cid: int) -> tuple[str, InlineKeyboardMarkup] |
         "<i>Joined/Left are counted from the moment tracking started.</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("💬 Welcome message", f"hp:wm:{cid}")],
         [btn("🔄 Refresh", f"hp:d:{cid}"), btn("⬅️ Back", "hp:dst")],
     ])
     return text, kb
+
+
+# ---- helper: different welcome message per channel (pre-request message of that destination) ----
+async def hp_wm_view(cid: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    d = await dest_get(cid)
+    if not d or cid not in {x["chat_id"] for x in await dest_all()}:
+        return None
+    dm = await dm_get(cid, "pre")
+    cur = int(dm["welcome_id"] or 0)
+    chosen = await wl_get(cur) if cur else None
+    default = await wl_get(int(await get_setting("active_welcome") or 0))
+    if not chosen:
+        cur = 0
+    using = (f"<b>{escape(chosen['name'])}</b>" if chosen
+             else f"⭐ default (<b>{escape(default['name']) if default else 'none set'}</b>)")
+    off = (await get_setting("welcome_enabled") != "1") or not dm["enabled"]
+    text = (
+        f"💬 <b>Welcome message — {escape(d['title'] or str(cid))}</b>\n\n"
+        f"Using: {using}\n\n"
+        "Pick the message people get when they ask to join <b>this channel</b>. "
+        "Each channel can have a different one."
+        + ("\n\n⚠️ Welcome messages are currently switched off, so nothing is sent yet." if off else "")
+    )
+    rows = [[btn(("✅ " if not cur else "") + "⭐ Use the default message", f"hp:wms:{cid}:0")]]
+    for w in (await wl_all())[:60]:
+        rows.append([btn(("✅ " if cur == w["id"] else "") + f"📨 {w['name'][:34]}", f"hp:wms:{cid}:{w['id']}")])
+    rows.append([btn("⬅️ Back", f"hp:d:{cid}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("hp:wm:"), IsHelper())
+async def cb_hp_wm(cb: CallbackQuery):
+    view = await hp_wm_view(int(cb.data.split(":")[2]))
+    if not view:
+        await cb.answer("Destination not found.", show_alert=True)
+        return
+    await edit(cb, *view)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("hp:wms:"), IsHelper())
+async def cb_hp_wms(cb: CallbackQuery):
+    _, _, cid_s, wid_s = cb.data.split(":")
+    cid, wid = int(cid_s), int(wid_s)
+    d = await dest_get(cid)
+    if not d or cid not in {x["chat_id"] for x in await dest_all()}:
+        await cb.answer("Destination not found.", show_alert=True)
+        return
+    if wid and not await wl_get(wid):
+        await cb.answer("That message no longer exists.", show_alert=True)
+        return
+    await dm_set(cid, "pre", welcome_id=wid)
+    mlog(f"💬 Welcome message set by helper · <b>{escape(d['title'] or '')}</b>")
+    await edit(cb, *await hp_wm_view(cid))
+    await cb.answer("Message set")
 
 
 @router.callback_query(F.data == "hp:dst", IsHelper())
@@ -2082,8 +2252,25 @@ async def hp_open_view(wid: int) -> tuple[str, InlineKeyboardMarkup] | None:
         rows.append([btn("🗑 Delete", f"hp:del:{wid}")])
     else:
         rows.append([btn("👁 View", f"hp:view:{wid}")])
+    rows.append([btn("⭐ Default ✓" if await is_primary(wid) else "⭐ Set as default", f"hp:prim:{wid}")])
     rows.append([btn("⬅️ Back", "hp:msgs")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("hp:prim:"), IsHelper())
+async def cb_hp_prim(cb: CallbackQuery):
+    """Helper picks the default (primary) welcome message – same setting the admin panel uses."""
+    wid = int(cb.data.split(":")[2])
+    if not await wl_get(wid):
+        await cb.answer("Message not found.", show_alert=True)
+        return
+    if await is_primary(wid):
+        await cb.answer("Already the default message.")
+        return
+    await set_setting("active_welcome", str(wid))
+    mlog(f"⭐ Default message set by helper · <b>{escape((await wl_get(wid))['name'])}</b>")
+    await edit(cb, *await hp_open_view(wid))
+    await cb.answer("⭐ Now the default for every channel without its own message.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("hp:open:"), IsHelper())
@@ -2104,12 +2291,14 @@ async def hp_editor_view(wid: int) -> tuple[str, InlineKeyboardMarkup] | None:
     text = (
         f"✏️ <b>{escape(w['name'])}</b>\n\n"
         f"📝 <b>Caption:</b>\n{short(w['caption'])}\n\n"
-        f"🖼 <b>Media:</b> {MEDIA_LABEL.get(w['media_type'], '— none')}\n\n"
+        f"🖼 <b>Media:</b> {MEDIA_LABEL.get(w['media_type'], '— none')}\n"
+        f"🔘 <b>Buttons:</b> {btn_count(w)}\n\n"
         "<i>Placeholders: {mention} {first_name} {full_name} {username} {chat_title}</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("📝 Set Caption", f"hp:cap:{wid}"), btn("🖼 Set Media", f"hp:media:{wid}")],
         [btn("❌ Remove Media", f"hp:nomedia:{wid}"), btn("🏷 Rename", f"hp:name:{wid}")],
+        [btn(f"🔘 Buttons ({btn_count(w)})", f"hp:btns:{wid}")],
         [btn("👁 Preview (real look)", f"hp:view:{wid}")],
         [btn("⬅️ Back", f"hp:open:{wid}")],
     ])
@@ -2257,6 +2446,67 @@ async def msg_hp_name(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Renamed.")
     await hp_show_editor(message, wid)
+
+
+# ---- helper: link buttons on his own messages ----
+@router.callback_query(F.data.startswith("hp:btns:"), IsHelper())
+async def cb_hp_btns(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    wid = int(cb.data.split(":")[2])
+    w = await _hp_own(wid)
+    if not w:
+        await cb.answer("Not your message.", show_alert=True)
+        return
+    await edit(cb, *btns_view(w, "hp", f"hp:edit:{wid}"))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("hp:btnadd:"), IsHelper())
+async def cb_hp_btnadd(cb: CallbackQuery, state: FSMContext):
+    wid = int(cb.data.split(":")[2])
+    w = await _hp_own(wid)
+    if not w:
+        await cb.answer("Not your message.", show_alert=True)
+        return
+    if btn_count(w) >= MAX_BTN:
+        await cb.answer(f"A message can have at most {MAX_BTN} buttons.", show_alert=True)
+        return
+    await state.set_state(Form.h_buttons)
+    await state.update_data(wid=wid)
+    await cb.message.answer(btn_prompt(w))
+    await cb.answer()
+
+
+@router.message(Form.h_buttons, IsHelper())
+async def msg_hp_buttons(message: Message, state: FSMContext):
+    wid = (await state.get_data())["wid"]
+    w = await _hp_own(wid)
+    if not w:
+        await state.clear()
+        await message.answer("❌ Not your message.")
+        return
+    new, err = parse_buttons(message.text or "", btn_count(w))
+    if err:
+        await message.answer(err + "\n\nTry again or /cancel.")
+        return
+    await wl_set_buttons(wid, btn_rows(w) + new)
+    await state.clear()
+    await message.answer("✅ Button(s) added.")
+    text, kb = btns_view(await wl_get(wid), "hp", f"hp:edit:{wid}")
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("hp:btnrm:"), IsHelper())
+async def cb_hp_btnrm(cb: CallbackQuery):
+    _, _, wid_s, idx_s = cb.data.split(":")
+    wid = int(wid_s)
+    w = await _hp_own(wid)
+    if not w:
+        await cb.answer("Not your message.", show_alert=True)
+        return
+    await wl_set_buttons(wid, btn_remove(w, int(idx_s)))
+    await edit(cb, *btns_view(await wl_get(wid), "hp", f"hp:edit:{wid}"))
+    await cb.answer("Button removed")
 
 
 @router.callback_query(F.data.startswith("hp:del:"), IsHelper())
@@ -2864,12 +3114,14 @@ async def editor_view(wid: int) -> tuple[str, InlineKeyboardMarkup] | None:
     text = (
         f"✏️ <b>{escape(w['name'])}</b>  {'⭐ <i>primary</i>' if prim else ''}\n\n"
         f"📝 <b>Caption:</b>\n{short(w['caption'])}\n\n"
-        f"🖼 <b>Media:</b> {MEDIA_LABEL.get(w['media_type'], '— none')}\n\n"
+        f"🖼 <b>Media:</b> {MEDIA_LABEL.get(w['media_type'], '— none')}\n"
+        f"🔘 <b>Buttons:</b> {btn_count(w)}\n\n"
         "<i>Placeholders: {mention} {first_name} {full_name} {username} {chat_title}</i>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [btn("📝 Set Caption", f"ms:cap:{wid}"), btn("🖼 Set Media", f"ms:media:{wid}")],
         [btn("❌ Remove Media", f"ms:nomedia:{wid}"), btn("🏷 Rename", f"ms:name:{wid}")],
+        [btn(f"🔘 Buttons ({btn_count(w)})", f"ms:btns:{wid}")],
         [btn("👁 Preview (real look)", f"ms:view:{wid}")],
         [btn("⬅️ Back", f"ms:open:{wid}")],
     ])
@@ -2988,6 +3240,67 @@ async def msg_wl_name(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ Renamed.")
     await show_editor(message, wid)
+
+
+# ---- link buttons (admin) ----
+@router.callback_query(F.data.startswith("ms:btns:"), IsAdmin())
+async def cb_ms_btns(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    wid = int(cb.data.split(":")[2])
+    w = await wl_get(wid)
+    if not w:
+        await cb.answer("Message not found.", show_alert=True)
+        return
+    await edit(cb, *btns_view(w, "ms", f"ms:edit:{wid}"))
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("ms:btnadd:"), IsAdmin())
+async def cb_ms_btnadd(cb: CallbackQuery, state: FSMContext):
+    wid = int(cb.data.split(":")[2])
+    w = await wl_get(wid)
+    if not w:
+        await cb.answer("Message not found.", show_alert=True)
+        return
+    if btn_count(w) >= MAX_BTN:
+        await cb.answer(f"A message can have at most {MAX_BTN} buttons.", show_alert=True)
+        return
+    await state.set_state(Form.wl_buttons)
+    await state.update_data(wid=wid)
+    await cb.message.answer(btn_prompt(w))
+    await cb.answer()
+
+
+@router.message(Form.wl_buttons, IsAdmin())
+async def msg_wl_buttons(message: Message, state: FSMContext):
+    wid = (await state.get_data())["wid"]
+    w = await wl_get(wid)
+    if not w:
+        await state.clear()
+        await message.answer("❌ Message not found.")
+        return
+    new, err = parse_buttons(message.text or "", btn_count(w))
+    if err:
+        await message.answer(err + "\n\nTry again or /cancel.")
+        return
+    await wl_set_buttons(wid, btn_rows(w) + new)
+    await state.clear()
+    await message.answer("✅ Button(s) added.")
+    text, kb = btns_view(await wl_get(wid), "ms", f"ms:edit:{wid}")
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("ms:btnrm:"), IsAdmin())
+async def cb_ms_btnrm(cb: CallbackQuery):
+    _, _, wid_s, idx_s = cb.data.split(":")
+    wid = int(wid_s)
+    w = await wl_get(wid)
+    if not w:
+        await cb.answer("Message not found.", show_alert=True)
+        return
+    await wl_set_buttons(wid, btn_remove(w, int(idx_s)))
+    await edit(cb, *btns_view(await wl_get(wid), "ms", f"ms:edit:{wid}"))
+    await cb.answer("Button removed")
 
 
 # ---- view / preview (real destination look) ----
